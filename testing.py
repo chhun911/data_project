@@ -59,6 +59,10 @@ def listen_for_peers():
     # Get all local IP addresses to avoid adding self as peer
     local_ips = get_all_local_ips()
     logging.info(f"Local IPs detected: {local_ips}")
+    
+    # Only store the main local IP for filtering
+    main_local_ip = local_ip
+    logging.info(f"Main local IP used for filtering: {main_local_ip}")
 
     while running:
         try:
@@ -68,13 +72,28 @@ def listen_for_peers():
 
             logging.info(f"Received message: {message} from {peer_ip}")
 
-            if message.startswith("DISCOVER:") and peer_ip not in local_ips:
-                with peers_lock:
-                    if peer_ip not in peers:
-                        peers.add(peer_ip)
-                        logging.info(f"New peer added: {peer_ip}")
-                    else:
-                        logging.info(f"Peer {peer_ip} already known.")
+            # Check if the IP is already in our peer list
+            with peers_lock:
+                is_known_peer = peer_ip in peers
+            
+            # Extract the IP from the message (not the sender's IP)
+            if message.startswith("DISCOVER:"):
+                parts = message.split(":")
+                if len(parts) >= 2:
+                    message_ip = parts[1]
+                    
+                    # If message IP matches our main local IP, skip adding this peer
+                    if message_ip == main_local_ip:
+                        logging.info(f"Ignoring self-broadcast from {peer_ip} with my IP {main_local_ip}")
+                        continue
+                    
+                    # Otherwise, consider adding the sender IP as a peer
+                    with peers_lock:
+                        if peer_ip not in peers:
+                            peers.add(peer_ip)
+                            logging.info(f"New peer added: {peer_ip}")
+                        else:
+                            logging.info(f"Peer {peer_ip} already known.")
         except Exception as e:
             logging.error(f"Error listening for peers: {e}")
 
