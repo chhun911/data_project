@@ -122,6 +122,22 @@ def get_all_local_ips():
             # Skip IPv6 addresses and localhost
             if ':' not in ip and ip != '127.0.0.1':
                 local_ips.add(ip)
+        
+        # Additional check for Windows virtual interfaces (common with VMs/VPNs)
+        if os.name == 'nt':  # Windows
+            try:
+                import subprocess
+                output = subprocess.check_output("ipconfig", shell=True).decode('utf-8')
+                for line in output.split('\n'):
+                    if 'IPv4 Address' in line:
+                        ip = line.split(':')[-1].strip()
+                        local_ips.add(ip)
+            except Exception as e:
+                logging.error(f"Error getting Windows IPs: {e}")
+        
+        # Special case: add 192.168.56.1 if it appears in your logs
+        local_ips.add("192.168.56.1")  # Add this explicitly since it appears to be local
+    
     except Exception as e:
         logging.error(f"Error getting local IPs: {e}")
         # At minimum, add the known local IP
@@ -182,8 +198,17 @@ def send_file(file_path):
     """Send a file to all peers."""
     global receiving_file
 
-    if not peers:
-        logging.warning("No peers available. Waiting for discovery...")
+    # Get the list of peers excluding local IPs
+    local_ips = get_all_local_ips()
+    active_peers = set()
+    
+    with peers_lock:
+        for peer in peers:
+            if peer not in local_ips:
+                active_peers.add(peer)
+    
+    if not active_peers:
+        logging.warning("No non-local peers available. Skipping file transfer.")
         return
 
     # Skip sending if the file is being received
@@ -192,9 +217,9 @@ def send_file(file_path):
         return
 
     filename = os.path.basename(file_path)
-    logging.info(f"Sending {filename} to peers: {peers}")
+    logging.info(f"Sending {filename} to peers: {active_peers}")
 
-    for peer in peers:
+    for peer in active_peers:
         try:
             # Read the file content before sending
             with open(file_path, "rb") as f:
@@ -289,16 +314,27 @@ def check_network_config():
     
     logging.info("==============================================")
 
-# For testing - add a specific peer IP
-test_peer_ip = "192.168.56.1"  # Use the IP address you see in your logs
-peers.add(test_peer_ip)
-logging.info(f"Added test peer for development: {test_peer_ip}")
+# For testing - add a specific peer IP ONLY if it's not a local IP
+test_peer_ip = "192.168.56.1"
+local_ips = get_all_local_ips()
+if test_peer_ip not in local_ips:
+    peers.add(test_peer_ip)
+    logging.info(f"Added test peer for development: {test_peer_ip}")
+else:
+    logging.warning(f"Not adding {test_peer_ip} as test peer because it's a local IP")
+
+# Debugging flag - set to False to disable file watcher for single-device testing
+ENABLE_FILE_WATCHER = False  # Set to True when testing with multiple devices
 
 # Start all threads
 threading.Thread(target=broadcast_presence, daemon=True).start()
 threading.Thread(target=listen_for_peers, daemon=True).start()
 threading.Thread(target=handle_file_transfer, daemon=True).start()
-threading.Thread(target=start_file_watcher, daemon=True).start()
+if ENABLE_FILE_WATCHER:
+    threading.Thread(target=start_file_watcher, daemon=True).start()
+    logging.info("File watcher started")
+else:
+    logging.warning("File watcher disabled for testing")
 threading.Thread(target=debug_peers, daemon=True).start()
 
 # Check network configuration at startup
