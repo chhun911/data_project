@@ -59,10 +59,6 @@ def listen_for_peers():
     # Get all local IP addresses to avoid adding self as peer
     local_ips = get_all_local_ips()
     logging.info(f"Local IPs detected: {local_ips}")
-    
-    # Only store the main local IP for filtering
-    main_local_ip = local_ip
-    logging.info(f"Main local IP used for filtering: {main_local_ip}")
 
     while running:
         try:
@@ -72,30 +68,44 @@ def listen_for_peers():
 
             logging.info(f"Received message: {message} from {peer_ip}")
 
-            # Check if the IP is already in our peer list
-            with peers_lock:
-                is_known_peer = peer_ip in peers
-            
-            # Extract the IP from the message (not the sender's IP)
+            # For testing: Add ANY IP that sends a discovery message
+            # except localhost or your own local IPs
             if message.startswith("DISCOVER:"):
-                parts = message.split(":")
-                if len(parts) >= 2:
-                    message_ip = parts[1]
-                    
-                    # If message IP matches our main local IP, skip adding this peer
-                    if message_ip == main_local_ip:
-                        logging.info(f"Ignoring self-broadcast from {peer_ip} with my IP {main_local_ip}")
-                        continue
-                    
-                    # Otherwise, consider adding the sender IP as a peer
-                    with peers_lock:
-                        if peer_ip not in peers:
-                            peers.add(peer_ip)
-                            logging.info(f"New peer added: {peer_ip}")
+                if peer_ip != "127.0.0.1" and peer_ip not in local_ips:
+                    # Extract the source IP from the message
+                    parts = message.split(":")
+                    if len(parts) >= 2:
+                        source_ip = parts[1]
+                        # Only add the peer if it's not claiming to be you
+                        if source_ip != local_ip:
+                            with peers_lock:
+                                if peer_ip not in peers:
+                                    peers.add(peer_ip)
+                                    logging.info(f"New peer added: {peer_ip}")
+                                else:
+                                    logging.info(f"Peer {peer_ip} already known.")
                         else:
-                            logging.info(f"Peer {peer_ip} already known.")
+                            logging.info(f"Ignoring peer claiming to be me: {source_ip}")
+                else:
+                    logging.info(f"Ignoring message from local IP: {peer_ip}")
         except Exception as e:
             logging.error(f"Error listening for peers: {e}")
+
+def debug_peers():
+    """Debug function to print current peer list periodically."""
+    while running:
+        with peers_lock:
+            if peers:
+                logging.info(f"Current peers ({len(peers)}): {peers}")
+            else:
+                logging.warning("No peers currently in list")
+        
+        # Also log the recently received files
+        with recently_received_lock:
+            if recently_received_files:
+                logging.info(f"Recently received files: {recently_received_files}")
+        
+        time.sleep(10)  # Print every 10 seconds
 
 def get_all_local_ips():
     """Get all IP addresses of this machine to avoid self-connections."""
@@ -246,11 +256,53 @@ def start_file_watcher():
         observer.stop()
     observer.join()
 
+def check_network_config():
+    """Function to check and log network configuration at startup."""
+    logging.info("============ NETWORK CONFIGURATION ============")
+    try:
+        # Log hostname and main IP
+        logging.info(f"Hostname: {hostname}")
+        logging.info(f"Main IP: {local_ip}")
+        
+        # Get all network interfaces without netifaces
+        try:
+            hostname = socket.gethostname()
+            logging.info(f"IP addresses for {hostname}:")
+            # Get all addresses from socket library
+            for addrinfo in socket.getaddrinfo(hostname, None):
+                ip = addrinfo[4][0]
+                if '.' in ip and ip != '127.0.0.1':  # Only show IPv4, skip localhost
+                    logging.info(f"  {ip}")
+            
+            # Additional check for Windows-specific interfaces
+            if os.name == 'nt':  # Windows
+                import subprocess
+                output = subprocess.check_output("ipconfig", shell=True).decode('utf-8')
+                for line in output.split('\n'):
+                    if 'IPv4 Address' in line:
+                        ip = line.split(':')[-1].strip()
+                        logging.info(f"  IPCONFIG: {ip}")
+        except Exception as e:
+            logging.error(f"Error getting IP addresses: {e}")
+    except Exception as e:
+        logging.error(f"Error in network check: {e}")
+    
+    logging.info("==============================================")
+
+# For testing - add a specific peer IP
+test_peer_ip = "192.168.56.1"  # Use the IP address you see in your logs
+peers.add(test_peer_ip)
+logging.info(f"Added test peer for development: {test_peer_ip}")
+
 # Start all threads
 threading.Thread(target=broadcast_presence, daemon=True).start()
 threading.Thread(target=listen_for_peers, daemon=True).start()
 threading.Thread(target=handle_file_transfer, daemon=True).start()
 threading.Thread(target=start_file_watcher, daemon=True).start()
+threading.Thread(target=debug_peers, daemon=True).start()
+
+# Check network configuration at startup
+check_network_config()
 
 logging.info("All threads started successfully!")
 try:
