@@ -6,6 +6,7 @@ import logging
 import platform
 import uuid
 import ipaddress
+import hashlib
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -32,12 +33,46 @@ peers_lock = threading.Lock()  # Lock for thread-safe access to peers
 running = True  # Flag to control threads
 receiving_file = False  # Flag to track if a file is being received
 
+# Track received files by their hash to prevent duplication
+file_hashes = {}  # {file_hash: {'timestamp': timestamp, 'filename': original_name}}
+file_hashes_lock = threading.Lock()
+
 # Add a set to track recently received files with timestamps
 recently_received_files = {}  # {file_path: timestamp}
 recently_received_lock = threading.Lock()
 
 # Ensure shared folder exists
 os.makedirs(SHARED_FOLDER, exist_ok=True)
+
+def calculate_file_hash(file_path):
+    """Calculate a SHA-256 hash of a file to uniquely identify it."""
+    try:
+        hasher = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            # Read in chunks to handle large files efficiently
+            for chunk in iter(lambda: f.read(65536), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        logging.error(f"Failed to calculate hash for {file_path}: {e}")
+        return None
+
+def scan_existing_files():
+    """Scan existing files in the shared folder and add their hashes to the dictionary."""
+    try:
+        for root, _, files in os.walk(SHARED_FOLDER):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                file_hash = calculate_file_hash(file_path)
+                if file_hash:
+                    with file_hashes_lock:
+                        file_hashes[file_hash] = {
+                            'timestamp': os.path.getmtime(file_path),
+                            'filename': filename
+                        }
+        logging.info(f"Scanned {len(file_hashes)} existing files in shared folder")
+    except Exception as e:
+        logging.error(f"Error scanning existing files: {e}")
 
 def get_all_local_ips():
     """Get all IP addresses of this machine to avoid self-connections."""
@@ -191,6 +226,23 @@ def process_incoming_file(conn, addr):
     
     try:
         conn.settimeout(10)  # Set timeout for receiving data
+        
+        # First receive the file hash to check if we already have it
+        file_hash = conn.recv(64).decode().strip()
+        
+        # Check if we already have this file
+        with file_hashes_lock:
+            if file_hash in file_hashes:
+                logging.info(f"Already have file with hash {file_hash}, skipping download")
+                conn.sendall(b"HAVE")
+                receiving_file = False
+                conn.close()
+                return
+            
+        # We don't have this file, proceed with receiving it
+        conn.sendall(b"PROCEED")
+            
+        # Now receive the filename
         filename = conn.recv(1024).decode()
 
         # Add a timestamp to the filename to avoid overwriting
@@ -226,6 +278,13 @@ def process_incoming_file(conn, addr):
 
         logging.info(f"File received: {new_filename} ({received_bytes} bytes)")
         
+        # Add the file to our hash dictionary
+        with file_hashes_lock:
+            file_hashes[file_hash] = {
+                'timestamp': time.time(),
+                'filename': filename
+            }
+        
         # Add the received file to the set of recently received files
         with recently_received_lock:
             recently_received_files[absolute_path] = time.time()
@@ -259,7 +318,20 @@ def send_file(file_path):
         logging.warning(f"File no longer exists or isn't readable: {file_path}")
         return
 
+    # Calculate file hash
+    file_hash = calculate_file_hash(file_path)
+    if not file_hash:
+        logging.error(f"Failed to calculate hash for {file_path}")
+        return
+        
+    # Store in our hash dictionary
     filename = os.path.basename(file_path)
+    with file_hashes_lock:
+        file_hashes[file_hash] = {
+            'timestamp': time.time(),
+            'filename': filename
+        }
+
     filesize = os.path.getsize(file_path)
     logging.info(f"Sending {filename} ({filesize} bytes) to {len(active_peers)} peers")
 
@@ -275,17 +347,27 @@ def send_file(file_path):
         # Send to each peer in a separate thread to not block the main thread
         send_thread = threading.Thread(
             target=send_file_to_peer,
-            args=(peer, filename, filesize, file_data),
+            args=(peer, filename, filesize, file_data, file_hash),
             daemon=True
         )
         send_thread.start()
 
-def send_file_to_peer(peer_ip, filename, filesize, file_data):
+def send_file_to_peer(peer_ip, filename, filesize, file_data, file_hash):
     """Send a file to a specific peer."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)  # Set timeout for connection
         sock.connect((peer_ip, FILE_PORT))
+        
+        # First send the file hash to let the peer decide if it needs the file
+        sock.send(file_hash.encode().ljust(64))
+        
+        # Wait for response - should the transfer proceed?
+        response = sock.recv(16).decode().strip()
+        if response == "HAVE":
+            logging.info(f"Peer {peer_ip} already has file {filename}, skipping transfer")
+            sock.close()
+            return
         
         # Send filename
         sock.send(filename.encode())
@@ -387,6 +469,13 @@ def cleanup_recent_files():
             for path in expired:
                 recently_received_files.pop(path, None)
         
+        # Also clean up old file hashes, but keep a longer history
+        with file_hashes_lock:
+            expired_hashes = [h for h, data in file_hashes.items()
+                            if current_time - data['timestamp'] > 86400]  # 24 hours
+            for h in expired_hashes:
+                file_hashes.pop(h, None)
+        
         logging.debug(f"Cleaned up {len(expired)} entries from recently received files")
 
 def start_file_watcher():
@@ -413,6 +502,9 @@ def display_status():
 
 # Import some additional modules we need
 import random
+
+# Scan existing files at startup
+scan_existing_files()
 
 # Start all threads
 broadcast_thread = threading.Thread(target=broadcast_presence, daemon=True)
